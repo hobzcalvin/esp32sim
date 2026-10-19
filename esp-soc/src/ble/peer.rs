@@ -41,7 +41,10 @@ enum Request {
     Characteristics,
     Descriptors,
     Read(u16),
+    /// `read-long`: Read, then Read Blob from each offset while a reply fills the MTU.
+    ReadLong(u16),
     Write(u16),
+    Mtu(u16),
 }
 
 #[derive(Debug, PartialEq)]
@@ -51,7 +54,15 @@ pub enum Command {
     Disconnect,
     Discover,
     Read(u16),
+    ReadLong(u16),
     Write(u16, Vec<u8>),
+    /// Write Command (0x52): no response, so it does not hold the queue.
+    WriteCmd(u16, Vec<u8>),
+    /// Exchange MTU as the client, offering this receive MTU.
+    Mtu(u16),
+    /// Hold later commands until this many notifications have arrived on the handle, counted
+    /// from the start of the connection: flow control against a peripheral that acks by notifying.
+    AwaitNotify(u16, u64),
     ReadUuid([u8; 16], [u8; 16]),
 }
 impl std::str::FromStr for Command {
@@ -64,8 +75,12 @@ impl std::str::FromStr for Command {
             ["disconnect"] => return Ok(Self::Disconnect),
             ["discover"] => return Ok(Self::Discover),
             ["read-uuid", service, characteristic] => return Ok(Self::ReadUuid(parse_uuid(service)?, parse_uuid(characteristic)?)),
-            ["read" | "subscribe", _] | ["write", _, _] => {}
-            _ => return Err("expected connect, central-stop, disconnect, discover, read HANDLE, read-uuid SERVICE CHARACTERISTIC, write HANDLE HEX, subscribe CCC_HANDLE".into()),
+            ["mtu", n] => {
+                return n.parse().ok().filter(|n| (23..=517).contains(n)).map(Self::Mtu)
+                    .ok_or_else(|| "BLE mtu requires a value from 23 to 517".into());
+            }
+            ["read" | "read-long" | "subscribe", _] | ["write" | "write-cmd", _, _] | ["await-notify", _, _] => {}
+            _ => return Err("expected connect, central-stop, disconnect, discover, mtu N, read HANDLE, read-long HANDLE, read-uuid SERVICE CHARACTERISTIC, write HANDLE HEX, write-cmd HANDLE HEX, await-notify HANDLE COUNT, subscribe CCC_HANDLE".into()),
         }
         let handle =
             if let Some(h) = parts[1].strip_prefix("0x") { u16::from_str_radix(h, 16) } else { parts[1].parse() }
@@ -74,12 +89,15 @@ impl std::str::FromStr for Command {
                 .ok_or("invalid BLE attribute handle")?;
         Ok(match parts[0] {
             "read" => Self::Read(handle),
+            "read-long" => Self::ReadLong(handle),
             "subscribe" => Self::Write(handle, vec![1, 0]),
+            "await-notify" => Self::AwaitNotify(handle, parts[2].parse().map_err(|_| "BLE await-notify requires a notification count")?),
             _ => {
                 let value = parts[2];
-                let bytes = hex_bytes(value).filter(|b| b.len() <= 20)
-                    .ok_or("BLE write requires at most 20 bytes of hexadecimal data")?;
-                Self::Write(handle, bytes)
+                // ATT_MTU - 3 is checked when the write runs, against the MTU then in force.
+                let bytes = hex_bytes(value).filter(|b| b.len() <= MAX_MTU as usize - 3)
+                    .ok_or("BLE write requires at most 514 bytes of hexadecimal data")?;
+                if parts[0] == "write-cmd" { Self::WriteCmd(handle, bytes) } else { Self::Write(handle, bytes) }
             }
         })
     }
@@ -95,6 +113,9 @@ fn parse_uuid(text: &str) -> Result<[u8; 16], String> {
     bytes.reverse();
     Ok(bytes)
 }
+/// The default ATT MTU, in force until an exchange raises it; and the most this central offers.
+const MTU: u16 = 23;
+const MAX_MTU: u16 = 517;
 fn read_by_type(start: u16, end: u16) -> Vec<u8> {
     vec![8, start as u8, (start >> 8) as u8, end as u8, (end >> 8) as u8, 3, 0x28]
 }
@@ -162,6 +183,13 @@ pub struct Peer {
     pending: Option<Request>,
     discovery_start: u16,
     value: Vec<u8>,
+    /// The value a `read-long` has assembled so far.
+    long_value: Vec<u8>,
+    /// The ATT MTU in force, and the receive MTU this central offers in an exchange.
+    mtu: u16,
+    offer_mtu: u16,
+    /// Notifications received per handle on this connection, for `await-notify`.
+    notified: std::collections::BTreeMap<u16, u64>,
 }
 impl Peer {
     fn new(link: Link) -> Self {
@@ -176,6 +204,10 @@ impl Peer {
             pending: None,
             discovery_start: 1,
             value: vec![100],
+            long_value: Vec::new(),
+            mtu: MTU,
+            offer_mtu: MTU,
+            notified: Default::default(),
         }
     }
     fn advertisement(&mut self, adv: Vec<u8>, scan_response: Vec<u8>) {
@@ -201,14 +233,37 @@ impl Peer {
                 break;
             }
             if !self.connected || self.guest_central { break; }
+            if let Command::AwaitNotify(handle, count) = *command {
+                if self.notified.get(&handle).copied().unwrap_or(0) < count { break; }
+                self.commands.pop_front();
+                continue;
+            }
             match self.commands.pop_front().unwrap() {
-                Command::Connect | Command::CentralStop | Command::Disconnect | Command::ReadUuid(..) => unreachable!(),
+                Command::Connect | Command::CentralStop | Command::Disconnect | Command::ReadUuid(..) | Command::AwaitNotify(..) => unreachable!(),
+                Command::Mtu(offer) => {
+                    self.offer_mtu = offer;
+                    self.pending = Some(Request::Mtu(offer));
+                    self.att(&[2, offer as u8, (offer >> 8) as u8]);
+                }
+                Command::WriteCmd(handle, value) => {
+                    if self.fits(handle, &value) {
+                        let mut p = vec![0x52, handle as u8, (handle >> 8) as u8];
+                        p.extend(value);
+                        self.att(&p);
+                    }
+                }
                 Command::Discover => self.discover(Request::Services, 1),
                 Command::Read(handle) => {
                     self.pending = Some(Request::Read(handle));
                     self.att(&att_read(handle));
                 }
+                Command::ReadLong(handle) => {
+                    self.long_value.clear();
+                    self.pending = Some(Request::ReadLong(handle));
+                    self.att(&att_read(handle));
+                }
                 Command::Write(handle, value) => {
+                    if !self.fits(handle, &value) { continue; }
                     self.pending = Some(Request::Write(handle));
                     let mut p = vec![0x12, handle as u8, (handle >> 8) as u8];
                     p.extend(value);
@@ -218,6 +273,14 @@ impl Peer {
         }
     }
     fn att(&mut self, pdu: &[u8]) { self.l2cap(4, pdu); }
+    /// A write value must fit one ATT PDU at the MTU in force: ATT_MTU - 3 bytes.
+    fn fits(&mut self, handle: u16, value: &[u8]) -> bool {
+        let max = self.mtu as usize - 3;
+        if value.len() > max {
+            self.log.push(format!("write of {} bytes to handle=0x{handle:04x} exceeds ATT_MTU - 3 = {max}; not sent", value.len()));
+        }
+        value.len() <= max
+    }
     fn l2cap(&mut self, cid: u16, pdu: &[u8]) { self.link.borrow_mut().to_controller.push_back(LinkAction::Data(cid, pdu.to_vec())); }
     fn poll(&mut self) {
         loop {
@@ -236,6 +299,8 @@ impl Peer {
                 LinkEvent::Connected(central) => {
                     self.connecting = false;
                     self.connected = true;
+                    self.mtu = MTU;
+                    self.notified.clear();
                     self.advertising = false;
                     self.guest_central = central;
                     self.log.push(format!(
@@ -299,11 +364,14 @@ impl Peer {
             return;
         }
         if p[0] == 2 && p.len() == 3 {
-            self.att(&[3, 23, 0]);
+            // The guest asked: answer with what this central offers, and both use the smaller.
+            self.mtu = word(&p[1..]).clamp(MTU, self.offer_mtu);
+            self.att(&[3, self.offer_mtu as u8, (self.offer_mtu >> 8) as u8]);
             return;
         }
         if p[0] == 0x1b || p[0] == 0x1d {
             if p.len() >= 3 {
+                *self.notified.entry(word(&p[1..])).or_default() += 1;
                 self.log.push(format!(
                     "notification handle=0x{:04x} value={} text={:?}",
                     word(&p[1..]),
@@ -322,6 +390,26 @@ impl Peer {
             self.log.push(format!("unsolicited ATT {}", hex(p)));
             return;
         };
+        if let Request::ReadLong(handle) = kind {
+            // Read Blob past the end: Invalid Offset (0x07) or Attribute Not Long (0x0b) ends it.
+            let done = if p[0] == 1 && p.len() == 5 && !self.long_value.is_empty() && matches!(p[4], 0x07 | 0x0b) { true }
+            else if p[0] == 0x0b || p[0] == 0x0d {
+                self.long_value.extend_from_slice(&p[1..]);
+                p.len() - 1 < self.mtu as usize - 1
+            } else {
+                self.log.push(format!("ATT error request=0x{:02x} handle=0x{handle:04x} error=0x{:02x}", p.get(1).copied().unwrap_or(0), p.get(4).copied().unwrap_or(0)));
+                return;
+            };
+            if done {
+                let v = std::mem::take(&mut self.long_value);
+                self.log.push(format!("read handle=0x{handle:04x} value={} text={:?}", hex(&v), String::from_utf8_lossy(&v)));
+            } else {
+                let offset = self.long_value.len() as u16;
+                self.pending = Some(Request::ReadLong(handle));
+                self.att(&[0x0c, handle as u8, (handle >> 8) as u8, offset as u8, (offset >> 8) as u8]);
+            }
+            return;
+        }
         if p[0] == 1 && p.len() == 5 {
             if p[4] == 0x0a && matches!(kind, Request::Services | Request::Characteristics | Request::Descriptors) {
                 self.discovery_next(kind);
@@ -336,6 +424,10 @@ impl Peer {
             return;
         }
         match kind {
+            Request::Mtu(offer) if p[0] == 3 && p.len() == 3 => {
+                self.mtu = word(&p[1..]).clamp(MTU, offer);
+                self.log.push(format!("mtu {}", self.mtu));
+            }
             Request::Read(handle) if p[0] == 0x0b => self.log.push(format!(
                 "read handle=0x{handle:04x} value={} text={:?}",
                 hex(&p[1..]),
@@ -523,7 +615,10 @@ mod tests {
         assert_eq!(hex_bytes("00aAFF"), Some(vec![0,170,255]));
         for bad in ["0", "0g", "é0"] { assert_eq!(hex_bytes(bad), None); }
         assert_eq!("write 1 00aAFF".parse::<Command>().unwrap(), Command::Write(1, vec![0,170,255]));
-        for bad in ["write 1 0", "write 1 zz", "write 1 é0", "write 1 000000000000000000000000000000000000000000"] { assert!(bad.parse::<Command>().is_err()); }
+        for bad in ["write 1 0", "write 1 zz", "write 1 é0"] { assert!(bad.parse::<Command>().is_err()); }
+        // 21 bytes parses (the MTU in force decides when it runs); more than MAX_MTU - 3 never fits.
+        assert!(format!("write 1 {}", "00".repeat(21)).parse::<Command>().is_ok());
+        assert!(format!("write 1 {}", "00".repeat(515)).parse::<Command>().is_err());
         assert_eq!(read_by_type(0x1234, 0x5678), [8,0x34,0x12,0x78,0x56,3,0x28]);
     }
 
@@ -780,5 +875,87 @@ mod tests {
         assert_eq!(c.controller.next_deadline(), Some(100));
         assert!(!c.peer.connected);
         assert!(c.peer.commands.is_empty());
+    }
+
+    /// A controller that keeps what the peer sends, so a test can read it.
+    struct Capture;
+    impl HciController for Capture {
+        fn send_h4(&mut self, _: &[u8]) {}
+        fn poll_h4(&mut self) -> Option<Vec<u8>> { None }
+        fn reset(&mut self) {}
+        fn advance_to(&mut self, _: u64) {}
+        fn next_deadline(&self) -> Option<u64> { None }
+    }
+    fn connected() -> (Session, Link) {
+        let link = Link::default();
+        let mut s = Session::new(Box::new(Capture), link.clone());
+        link.borrow_mut().to_peer.push_back(LinkEvent::Connected(false));
+        s.advance_to(0);
+        (s, link)
+    }
+    fn sent_att(link: &Link) -> Vec<Vec<u8>> {
+        link.borrow_mut().to_controller.drain(..).filter_map(|a| match a { LinkAction::Data(4, p) => Some(p), _ => None }).collect()
+    }
+
+    #[test]
+    fn mtu_exchange_raises_the_write_limit() {
+        assert_eq!("mtu 247".parse::<Command>().unwrap(), Command::Mtu(247));
+        for bad in ["mtu 22", "mtu 518", "mtu x"] { assert!(bad.parse::<Command>().is_err()); }
+        let (mut s, link) = connected();
+        let big = format!("write 3 {}", "ab".repeat(21));
+        s.command(&big).unwrap();
+        assert!(sent_att(&link).is_empty(), "21 bytes do not fit MTU 23");
+        assert!(s.drain_log().iter().any(|l| l.contains("exceeds ATT_MTU - 3 = 20")));
+        s.command("mtu 247").unwrap();
+        assert_eq!(sent_att(&link), vec![vec![2, 247, 0]]);
+        link.borrow_mut().to_peer.push_back(LinkEvent::Data(4, vec![3, 0x05, 0x02])); // server offers 517
+        s.advance_to(1);
+        assert!(s.drain_log().iter().any(|l| l == "mtu 247"), "the smaller of the two MTUs");
+        s.command(&big).unwrap();
+        let att = sent_att(&link);
+        assert_eq!(att.len(), 1);
+        assert_eq!(&att[0][..3], &[0x12, 3, 0]);
+        assert_eq!(att[0].len(), 3 + 21);
+    }
+
+    #[test]
+    fn write_command_needs_no_response_and_await_notify_holds_the_queue() {
+        assert_eq!("write-cmd 3 01".parse::<Command>().unwrap(), Command::WriteCmd(3, vec![1]));
+        assert_eq!("await-notify 3 2".parse::<Command>().unwrap(), Command::AwaitNotify(3, 2));
+        let (mut s, link) = connected();
+        s.command("write-cmd 3 01").unwrap();
+        s.command("write-cmd 3 02").unwrap();
+        assert_eq!(sent_att(&link), vec![vec![0x52, 3, 0, 1], vec![0x52, 3, 0, 2]], "both go without waiting");
+        s.command("await-notify 3 2").unwrap();
+        s.command("write-cmd 3 03").unwrap();
+        assert!(sent_att(&link).is_empty());
+        let notify = |n: u8| LinkEvent::Data(4, vec![0x1b, 3, 0, n]);
+        link.borrow_mut().to_peer.push_back(notify(1));
+        s.advance_to(1);
+        assert!(sent_att(&link).is_empty(), "one of two notifications");
+        link.borrow_mut().to_peer.push_back(notify(2));
+        s.advance_to(2);
+        assert_eq!(sent_att(&link), vec![vec![0x52, 3, 0, 3]]);
+        assert_eq!(s.pending_commands(), 0);
+    }
+
+    #[test]
+    fn read_long_follows_the_negotiated_mtu() {
+        let (mut s, link) = connected();
+        s.command("mtu 100").unwrap();
+        sent_att(&link);
+        link.borrow_mut().to_peer.push_back(LinkEvent::Data(4, vec![3, 100, 0]));
+        s.advance_to(1);
+        s.command("read-long 5").unwrap();
+        assert_eq!(sent_att(&link), vec![vec![0x0a, 5, 0]]);
+        let mut first = vec![0x0b]; first.extend([7u8; 99]);           // fills MTU - 1: more follows
+        link.borrow_mut().to_peer.push_back(LinkEvent::Data(4, first));
+        s.advance_to(2);
+        assert_eq!(sent_att(&link), vec![vec![0x0c, 5, 0, 99, 0]], "Read Blob from offset 99");
+        link.borrow_mut().to_peer.push_back(LinkEvent::Data(4, vec![0x0d, 8, 9]));
+        s.advance_to(3);
+        let log = s.drain_log();
+        let line = log.iter().find(|l| l.starts_with("read handle=0x0005")).expect("one read line");
+        assert!(line.contains(&format!("value={}0809", "07".repeat(99))));
     }
 }

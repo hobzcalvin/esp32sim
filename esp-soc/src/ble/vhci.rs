@@ -154,6 +154,7 @@ impl Ble {
 
 pub fn install<B: VhciBus>(bus: &mut B) -> Result<(), String> {
     let abi = B::abi();
+    bus.ble().session.controller.set_clock(abi.hz);
     let b = bus.ble();
     let (entry, init, buffer) = (b.entry, b.init, b.buffer);
     let literals = [b.create, init + TASK, buffer + 4, b.delay, init + POLL, init + CREATED, buffer, 4096];

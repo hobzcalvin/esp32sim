@@ -167,14 +167,25 @@ use seconds like the other script actions. For example:
 ```
 
 Use handles reported by discovery. `ble subscribe CCC_HANDLE` writes notification
-enable to a discovered client configuration descriptor. Commands are validated when
+enable to a discovered client configuration descriptor. `ble read-long HANDLE` reads a value longer than
+one ATT payload: a Read, then Read Blob requests until a reply is shorter than MTU - 1; it logs
+one `read` line with the whole value. `ble mtu N` (23..517) exchanges MTU as the client and logs
+`mtu M`, the smaller of the two offers; writes may then carry up to M - 3 bytes. `ble write-cmd
+HANDLE HEX` sends a Write Command (write without response), which does not hold the queue.
+`ble await-notify HANDLE COUNT` holds later BLE commands until COUNT notifications in all have
+arrived on HANDLE in this connection: flow control against a peripheral that acks by notifying,
+such as a sliding-window firmware upload. A queue left waiting is reported as pending at exit. Commands are validated when
 CLI arguments are parsed, before loading the ROM, and require `--ble`. `connect` waits for guest advertising;
 ATT commands wait for the connection and run in order, with one request outstanding.
 At exit, the CLI reports the number of queued or in-flight commands still pending.
-Writes are limited to 20 bytes. A scanning guest sees a virtual
+Writes are limited to ATT_MTU - 3 bytes, 20 until `ble mtu` raises it. A scanning guest sees a virtual
 peripheral named `esp32sim` advertising the Battery Service.
 
-This models one unencrypted LE link, legacy advertisements and ATT MTU 23.
+This models one unencrypted LE link, legacy advertisements and ATT MTU 23 unless `ble mtu`
+exchanges a larger one. Data to the host is split into 251-byte ACL packets, and with the guest
+clock known (S3/C3) at most four of them reach the host per 30 ms connection event, the interval
+the controller reports: a burst is spread over events as on a real link, instead of arriving at
+once and exhausting the host's ACL buffers.
 It does not model RF, pairing, physical connection timing or the controller's
 registers. Unsupported HCI commands return Unknown Command. The callback task
 and its storage stay allocated until reboot. C6 initializes the guest NPL support

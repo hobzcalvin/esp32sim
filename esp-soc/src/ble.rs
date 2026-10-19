@@ -18,6 +18,8 @@ pub trait HciController {
     fn reset(&mut self);
     fn advance_to(&mut self, cycles: u64);
     fn next_deadline(&self) -> Option<u64>;
+    /// The guest CPU clock, for controllers that model air time. Default: none modeled.
+    fn set_clock(&mut self, _hz: u64) {}
 }
 
 /// Put back the flash bytes a controller adapter patched (VHCI on classic/S3/C3, NimBLE on C6).
@@ -58,6 +60,14 @@ pub enum LinkAction {
 }
 
 const HANDLE: u16 = 1;
+/// ACL data packet length the controller reports (0xfb) and fragments to.
+const ACL_DATA_LEN: usize = 251;
+/// Air pacing, once the CPU clock is known: the connection interval the controller reports in
+/// LE Connection Complete (24 x 1.25 ms) and how many ACL packets reach the host per event. A
+/// real link spreads a burst over connection events and the host task drains its buffers in
+/// between; delivered all at once, a few kilobytes exhaust the NimBLE host's ACL mbufs.
+const CONN_EVENT_MS: u64 = 30;
+const PACKETS_PER_EVENT: usize = 4;
 const ADDRESS: [u8; 6] = [1, 0, 0, 0x49, 0x53, 2];
 const PEER: [u8; 6] = [2, 0, 0, 0x49, 0x53, 2];
 
@@ -77,6 +87,11 @@ pub struct Controller {
     random: u64,
     local_name: [u8; 248],
     default_link_policy: u16,
+    /// ACL packets for the host waiting for a connection event, and the pacing state.
+    air: VecDeque<Vec<u8>>,
+    event_cycles: u64,
+    event_index: u64,
+    event_sent: usize,
 }
 
 impl Default for Controller { fn default() -> Self { Self::new(Link::default()) } }
@@ -95,9 +110,27 @@ impl Controller {
             random: 0x3253_5045_424c_4531,
             local_name: [0; 248],
             default_link_policy: 0,
+            air: VecDeque::new(),
+            event_cycles: 0,
+            event_index: 0,
+            event_sent: 0,
         }
     }
-    pub fn pop_packet(&mut self) -> Option<Vec<u8>> { self.packets.pop_front() }
+    pub fn pop_packet(&mut self) -> Option<Vec<u8>> {
+        self.release_air();
+        self.packets.pop_front()
+    }
+    /// Move this connection event's share of waiting ACL packets to the host.
+    fn release_air(&mut self) {
+        if self.event_cycles == 0 { return; }
+        let index = self.cycles / self.event_cycles;
+        if index != self.event_index { self.event_index = index; self.event_sent = 0; }
+        while self.event_sent < PACKETS_PER_EVENT {
+            let Some(p) = self.air.pop_front() else { break };
+            self.packets.push_back(p);
+            self.event_sent += 1;
+        }
+    }
     fn emit(&mut self, event: LinkEvent) { self.link.borrow_mut().to_peer.push_back(event); }
     fn event(&mut self, event: u8, data: &[u8]) {
         let mut p = vec![4, event, data.len() as u8];
@@ -110,14 +143,20 @@ impl Controller {
         self.event(0x0e, &p);
     }
     fn status(&mut self, op: u16, status: u8) { self.event(0x0f, &[status, 1, op as u8, (op >> 8) as u8]); }
+    /// One L2CAP PDU to the host, split into ACL fragments of at most ACL_DATA_LEN bytes (the
+    /// LE buffer size READ/LE_READ_BUFFER_SIZE report): start, then continuations.
     fn l2cap(&mut self, cid: u16, pdu: &[u8]) {
         let len = pdu.len() as u16;
-        let mut p = vec![2, HANDLE as u8, 0x20];
-        p.extend_from_slice(&(len + 4).to_le_bytes());
-        p.extend_from_slice(&len.to_le_bytes());
-        p.extend_from_slice(&cid.to_le_bytes());
-        p.extend_from_slice(pdu);
-        self.packets.push_back(p);
+        let mut frame = Vec::with_capacity(pdu.len() + 4);
+        frame.extend_from_slice(&len.to_le_bytes());
+        frame.extend_from_slice(&cid.to_le_bytes());
+        frame.extend_from_slice(pdu);
+        for (i, chunk) in frame.chunks(ACL_DATA_LEN).enumerate() {
+            let mut p = vec![2, HANDLE as u8, if i == 0 { 0x20 } else { 0x10 }];
+            p.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+            p.extend_from_slice(chunk);
+            if self.event_cycles == 0 { self.packets.push_back(p); } else { self.air.push_back(p); }
+        }
     }
     fn connect(&mut self, guest_central: bool) {
         self.connected = true;
@@ -206,6 +245,7 @@ impl Controller {
                 self.connected = false;
                 self.emit(LinkEvent::Reset);
                 self.fragments.clear();
+                self.air.clear();
                 self.adv.clear();
                 self.scan_response.clear();
                 self.active_scan = false;
@@ -327,6 +367,7 @@ impl Controller {
                 self.event(5, &[0, HANDLE as u8, 0, p[2]]);
                 self.connected = false;
                 self.fragments.clear();
+                self.air.clear();
                 self.emit(LinkEvent::Disconnected);
             }
             LE_READ_CHANNEL_MAP => self.complete(op, &[0, p[0], p[1], 0xff, 0xff, 0xff, 0xff, 0x1f]),
@@ -434,7 +475,9 @@ impl HciController for Controller {
     fn poll_h4(&mut self) -> Option<Vec<u8>> { self.pop_packet() }
     fn reset(&mut self) {
         *self.link.borrow_mut() = LinkQueues::default();
+        let event_cycles = self.event_cycles;
         *self = Self::new(self.link.clone());
+        self.event_cycles = event_cycles;
     }
     fn advance_to(&mut self, cycles: u64) {
         self.cycles = cycles;
@@ -459,6 +502,57 @@ impl HciController for Controller {
                 _ => {}
             }
         }
+        self.release_air();
     }
-    fn next_deadline(&self) -> Option<u64> { (!self.link.borrow().to_controller.is_empty()).then_some(self.cycles) }
+    fn next_deadline(&self) -> Option<u64> {
+        if !self.link.borrow().to_controller.is_empty() { return Some(self.cycles); }
+        (!self.air.is_empty()).then(|| (self.event_index + 1) * self.event_cycles)
+    }
+    fn set_clock(&mut self, hz: u64) { self.event_cycles = hz * CONN_EVENT_MS / 1000; }
+}
+
+#[cfg(test)]
+mod air_tests {
+    use super::*;
+
+    fn connected() -> Controller {
+        let mut c = Controller::new(Link::default());
+        c.connected = true;
+        c
+    }
+
+    #[test]
+    fn l2cap_to_the_host_is_fragmented_at_the_acl_length() {
+        let mut c = connected();
+        c.l2cap(4, &[0x1b; 600]);
+        let p: Vec<_> = std::iter::from_fn(|| c.pop_packet()).collect();
+        assert_eq!(p.len(), 3);
+        assert_eq!((p[0][2], word(&p[0][3..])), (0x20, 251), "start fragment");
+        assert_eq!((p[1][2], word(&p[1][3..])), (0x10, 251), "continuation");
+        assert_eq!((p[2][2], word(&p[2][3..])), (0x10, 604 - 502), "last continuation");
+        assert_eq!(word(&p[0][5..]), 600, "L2CAP length in the first fragment");
+    }
+
+    #[test]
+    fn with_a_clock_a_burst_is_spread_over_connection_events() {
+        let mut c = connected();
+        c.set_clock(1000);                       // 30 cycles per 30 ms event
+        for _ in 0..10 { c.l2cap(4, &[0x1b, 3, 0]); }
+        c.advance_to(0);
+        let first: Vec<_> = std::iter::from_fn(|| c.pop_packet()).collect();
+        assert_eq!(first.len(), PACKETS_PER_EVENT);
+        assert_eq!(c.next_deadline(), Some(30));
+        c.advance_to(30);
+        assert_eq!(std::iter::from_fn(|| c.pop_packet()).count(), PACKETS_PER_EVENT);
+        c.advance_to(60);
+        assert_eq!(std::iter::from_fn(|| c.pop_packet()).count(), 2);
+        assert_eq!(c.next_deadline(), None);
+    }
+
+    #[test]
+    fn without_a_clock_nothing_is_held_back() {
+        let mut c = connected();
+        for _ in 0..10 { c.l2cap(4, &[0x1b, 3, 0]); }
+        assert_eq!(std::iter::from_fn(|| c.pop_packet()).count(), 10);
+    }
 }
