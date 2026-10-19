@@ -27,6 +27,11 @@ pub struct VirtualNet {
     pub arp_replies: u64,
     pub pings: u64,
     pub unhandled: u64,
+    /// UDP datagrams injected from the host side (script `udp`), and the station's MAC to send
+    /// them to, learnt from the first frame it sends.
+    pub injected_udp: u64,
+    station_mac: Option<[u8; 6]>,
+    inbound: Vec<Vec<u8>>,
     now_us: u64,
 }
 
@@ -39,7 +44,7 @@ impl VirtualNet {
     pub fn new(log: bool) -> Self {
         VirtualNet { gw_mac: GATEWAY_MAC, gw_ip: [10, 0, 2, 2], dns_ip: [10, 0, 2, 3],
                      sta_ip: [10, 0, 2, 15], mask: [255, 255, 255, 0],
-                     log, nat: None, dhcp_acks: 0, dns_answers: 0, ntp_answers: 0, tcp_rejects: 0, arp_replies: 0, pings: 0, unhandled: 0, now_us: 0 }
+                     log, nat: None, dhcp_acks: 0, dns_answers: 0, ntp_answers: 0, tcp_rejects: 0, arp_replies: 0, pings: 0, unhandled: 0, injected_udp: 0, station_mac: None, inbound: Vec::new(), now_us: 0 }
     }
 
     /// Handle one Ethernet frame from the station; returns frames to send back to it.
@@ -47,6 +52,7 @@ impl VirtualNet {
         if eth.len() < 14 { return Vec::new(); }
         self.now_us = now_us;
         let mut src = [0u8; 6]; src.copy_from_slice(&eth[6..12]);
+        if src[0] & 1 == 0 { self.station_mac = Some(src); }
         match be16(&eth[12..14]) {
             0x0806 => self.arp(&eth[14..], &src),
             0x0800 => self.ipv4(&eth[14..], &src),
@@ -178,7 +184,21 @@ impl VirtualNet {
     /// Pump the NAT's host sockets; returns frames for the guest.
     pub fn poll(&mut self, now_us: u64) -> Vec<Vec<u8>> {
         self.now_us = now_us;
-        match &mut self.nat { Some(n) => n.poll(now_us), None => Vec::new() }
+        let mut out = std::mem::take(&mut self.inbound);
+        if let Some(n) = &mut self.nat { out.extend(n.poll(now_us)); }
+        out
+    }
+
+    /// Queue a UDP datagram from the gateway to the station; it goes out with the next poll.
+    pub fn inject_udp(&mut self, sport: u16, dport: u16, payload: &[u8]) -> Result<(), String> {
+        let Some(mac) = self.station_mac else { return Err("udp: the station has not joined the network yet".into()) };
+        if payload.len() > 1472 { return Err("udp: payload over 1472 bytes does not fit one frame".into()); }
+        let udp = udp_packet(&self.gw_ip, &self.sta_ip, sport, dport, payload);
+        let frame = self.frame(&mac, 0x0800, &ip_packet(17, &self.gw_ip, &self.sta_ip, &udp));
+        self.inbound.push(frame);
+        self.injected_udp += 1;
+        if self.log { eprintln!("[net] UDP {} bytes injected -> port {}", payload.len(), dport); }
+        Ok(())
     }
 
     /// Answer A queries with the local resolver address, so name lookups resolve to something that
@@ -331,5 +351,27 @@ mod tests {
         assert_eq!(reply[0][34], 0);
         assert_eq!(checksum(&reply[0][14..34], 0), 0);
         assert_eq!(checksum(&reply[0][34..], 0), 0);
+    }
+
+    #[test]
+    fn injected_udp_reaches_the_station_once_it_is_known() {
+        let mut net = VirtualNet::new(false);
+        assert!(net.inject_udp(1000, 6454, b"Art-Net").unwrap_err().contains("not joined"));
+        let station = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let mut arp = vec![0xff; 6]; arp.extend(station); arp.extend([0x08, 0x06]); arp.extend([0u8; 28]);
+        net.handle(&arp, 0);
+        net.inject_udp(1000, 6454, b"Art-Net\0").unwrap();
+        let out = net.poll(1);
+        assert_eq!(out.len(), 1);
+        let f = &out[0];
+        assert_eq!(&f[..6], &station, "to the station's MAC");
+        assert_eq!(be16(&f[12..14]), 0x0800);
+        let ip = &f[14..];
+        assert_eq!((ip[9], &ip[12..16], &ip[16..20]), (17, &net.gw_ip[..], &net.sta_ip[..]), "UDP from the gateway to the station");
+        let udp = &ip[20..];
+        assert_eq!((be16(udp), be16(&udp[2..])), (1000, 6454));
+        assert_eq!(&udp[8..], b"Art-Net\0");
+        assert!(net.poll(2).is_empty(), "sent once");
+        assert_eq!(net.injected_udp, 1);
     }
 }

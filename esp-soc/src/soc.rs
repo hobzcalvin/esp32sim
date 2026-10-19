@@ -108,6 +108,9 @@ pub trait SocBus: Bus {
     /// Select host Ethernet transport instead of the built-in virtual network. Off by default.
     /// Changing modes clears queued Ethernet frames; the selection survives chip reset.
     fn set_ethernet_relay(&mut self, _enabled: bool) -> Result<(), String> { Err("this chip has no Ethernet transport".into()) }
+    /// A UDP datagram from the gateway (10.0.2.2:`sport`) to the station's `dport`, as a sender on
+    /// the access point's network would send it (script `udp`). Needs `--wifi` and an associated station.
+    fn net_inject_udp(&mut self, _sport: u16, _dport: u16, _payload: &[u8]) -> Result<(), String> { Err("this chip has no WiFi".into()) }
     /// Drain complete Ethernet frames without FCS, in transmit order. Empty outside relay mode.
     fn take_ethernet_frames(&mut self) -> Vec<Vec<u8>> { Vec::new() }
     /// Queue a 14..=1518-byte Ethernet frame without FCS. Requires relay mode and an AP.

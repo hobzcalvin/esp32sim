@@ -136,6 +136,11 @@ select ADC1 and GPIO5 selects ADC2; C6 GPIO0–6 select ADC1.
 2 adcwave 1 /tmp/adc-volts.txt 1000
 ```
 
+`udp <port> <hex>` sends a UDP datagram from the gateway (10.0.2.2, source port = `port`) to the
+station's `port`, as a sender on the access point's network would: Art-Net, DDP or any other
+inbound protocol, at an exact emulated time. It needs `--wifi` and a station that has joined;
+before that the line is reported and dropped.
+
 `waituart0 <timeout_s> <text>` holds later actions until UART0 prints the text or
 the timeout expires. Raw counts and completed-conversion observations are exposed
 through the [host ADC API](peripherals.md#host-adc-inputs), with no CLI equivalent.

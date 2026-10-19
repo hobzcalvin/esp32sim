@@ -434,6 +434,14 @@ impl StationLink {
     pub fn ap_mut(&mut self) -> Option<&mut VirtualAp> { self.ap.as_mut() }
     pub fn net(&self) -> Option<&crate::net::VirtualNet> { self.net.as_ref() }
     pub fn net_mut(&mut self) -> Option<&mut crate::net::VirtualNet> { self.net.as_mut() }
+    /// `VirtualNet::inject_udp`, for the bus's `net_inject_udp`. The poll that sends it is forced due.
+    pub fn inject_udp(&mut self, sport: u16, dport: u16, payload: &[u8]) -> Result<(), String> {
+        if self.relay { return Err("udp: not available in Ethernet relay mode".into()); }
+        let net = self.net.as_mut().ok_or("udp: no WiFi network (use --wifi)")?;
+        net.inject_udp(sport, dport, payload)?;
+        self.net_polled_us = self.net_polled_us.wrapping_sub(NET_POLL_US);
+        Ok(())
+    }
     pub fn relay(&self) -> bool { self.relay }
     /// The descriptor the last received frame went into, 0 before the first one.
     pub fn last_rx_desc(&self) -> u32 { self.last_rx_desc }
@@ -536,7 +544,8 @@ impl StationLink {
     pub fn report(&self) -> String {
         let mut lines = Vec::new();
         if self.tx_frames + self.rx_frames > 0 { lines.push(format!("[emu] wifi: {} frames sent by the station, {} received ({} dropped: no descriptor){}", self.tx_frames, self.rx_frames, self.rx_dropped, self.ap.as_ref().map_or(String::new(), |ap| format!("; AP: {} beacons, {} probe responses, {} data frames from the station, state {:?}", ap.stats.0, ap.stats.1, ap.stats.2, ap.state)))); }
-        if let Some(n) = &self.net { lines.push(format!("[emu] net: {} DHCP leases, {} ARP replies, {} DNS answers, {} NTP answers, {} TCP refused, {} pings, {} frames ignored", n.dhcp_acks, n.arp_replies, n.dns_answers, n.ntp_answers, n.tcp_rejects, n.pings, n.unhandled));
+        if let Some(n) = &self.net { lines.push(format!("[emu] net: {} DHCP leases, {} ARP replies, {} DNS answers, {} NTP answers, {} TCP refused, {} pings, {} frames ignored{}", n.dhcp_acks, n.arp_replies, n.dns_answers, n.ntp_answers, n.tcp_rejects, n.pings, n.unhandled,
+                if n.injected_udp > 0 { format!(", {} UDP injected", n.injected_udp) } else { String::new() }));
             if let Some(t) = &n.nat { lines.push(format!("[emu] nat: {} TCP connections ({} failed), {} UDP flows ({} evicted, {} send errors), {} bytes out, {} bytes in", t.tcp_opened, t.tcp_refused, t.udp_flows, t.udp_evicted, t.udp_send_errors, t.bytes_to_host, t.bytes_to_guest)); } }
         lines.join("\n")
     }

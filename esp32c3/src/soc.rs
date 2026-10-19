@@ -46,6 +46,9 @@ impl esp_soc::SocBus for SocBus {
         if self.periph.ble_lc.enabled() { self.periph.ble_lc.command(command) }
         else { self.ble.command(command, self.cycles, periph::CPU_HZ) }
     }
+    fn net_inject_udp(&mut self, sport: u16, dport: u16, payload: &[u8]) -> Result<(), String> {
+        self.periph.wifi.link.inject_udp(sport, dport, payload)
+    }
     fn attach_wifi(&mut self, cfg: esp_soc::wifi::ApConfig, nat: Option<esp_soc::nat::Nat>) -> Result<(), String> {
         self.periph.wifi.link.attach_new(cfg, nat, &self.debug);
         self.periph.refresh_work();
