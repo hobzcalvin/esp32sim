@@ -179,3 +179,16 @@ fn analog_scripts_reach_classic_adc_and_touch_registers() {
         assert_eq!(m.bus.read32(0x3ff4_8870).unwrap() >> 16, touch);
     }
 }
+
+#[test]
+fn flash_out_returns_what_the_guest_left_in_flash() {
+    let o = parse(&["esp32sim".into(), "--flash-out".into(), "/tmp/f.bin".into()], "s3");
+    assert_eq!(o.flash_out.as_deref(), Some("/tmp/f.bin"));
+    let mut s3 = esp32s3::machine([0; 6]);
+    s3.write_flash(0x9000, &[1, 2, 3]).unwrap();
+    assert_eq!(&s3.bus.flash_contents()[0x9000..0x9003], &[1, 2, 3]);
+    let mut c3 = esp32c3::machine([0; 6], 4 << 20);
+    c3.write_flash(0x1000, &[9]).unwrap();
+    assert_eq!(c3.bus.flash_contents().len(), 4 << 20);
+    assert_eq!(c3.bus.flash_contents()[0x1000], 9);
+}

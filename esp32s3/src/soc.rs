@@ -103,6 +103,7 @@ impl esp_soc::SocBus for SocBus {
     }
     fn misc(&mut self) -> &mut Misc { &mut self.periph.misc }
     fn load_bytes(&mut self, addr: u32, data: &[u8]) -> Result<(), String> { SocBus::load_bytes(self, addr, data) }
+    fn flash_contents(&self) -> &[u8] { &self.flash }
     fn write_flash(&mut self, offset: usize, data: &[u8]) -> Result<(), String> {
         let target = self.flash.get_mut(offset..).and_then(|tail| tail.get_mut(..data.len()))
             .ok_or("flash image too large")?;

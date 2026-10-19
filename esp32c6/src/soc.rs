@@ -66,6 +66,7 @@ impl esp_soc::SocBus for SocBus {
     fn take_host_event(&mut self) -> bool { self.periph.radio.take_tx_started() }
     fn misc(&mut self) -> &mut Misc { &mut self.periph.misc }
     fn load_bytes(&mut self, addr: u32, data: &[u8]) -> Result<(), String> { SocBus::load_bytes(self, addr, data) }
+    fn flash_contents(&self) -> &[u8] { &self.flash }
     fn write_flash(&mut self, offset: usize, data: &[u8]) -> Result<(), String> { SocBus::write_flash(self, offset, data) }
     /// Copy the RAM segments and map the flash-resident ones through the MMU, as the 2nd-stage
     /// bootloader would. One flat window for code and data makes this straightforward here;

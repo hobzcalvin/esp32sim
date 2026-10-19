@@ -68,7 +68,7 @@ pub struct Opts {
     pub approximate_cache: bool,
     pub chip: String,
     pub rom: Option<PathBuf>, pub bootloader: Option<String>, pub ptable: Option<String>, pub app: Option<String>, pub elfs: Vec<String>,
-    pub flash_image: Option<String>, pub flash_at: Vec<String>, pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>,
+    pub flash_image: Option<String>, pub flash_out: Option<String>, pub flash_at: Vec<String>, pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>,
     pub mac: Option<[u8; 6]>, pub strap: Option<u32>, pub reset_cause: Option<u32>, pub efuse_regs: Option<String>, pub regs_init: Option<String>,
     pub board: String, pub wifi: Option<String>, pub ble: bool, pub ble_full: bool, pub ble_observe: bool, pub ble_scan: bool, pub net: String, pub cam_image: Option<String>, pub cam_stream: Option<String>, pub cam_size: Option<String>, pub cam_fps: f64,
     pub spi2_timing: bool, pub measured_te: bool,
@@ -103,6 +103,7 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--elf" => o.elfs.push(next()),
             "--flash-image" => o.flash_image = Some(next()),
             "--flash-at" => o.flash_at.push(next()),
+            "--flash-out" => o.flash_out = Some(next()),
             "--boot" => o.boot = Some(next()),
             "--flash-mb" => o.flash_mb = Some(next().parse().expect("mb")),
             "--psram-mb" => o.psram_mb = Some(next().parse().expect("mb")),
@@ -390,6 +391,12 @@ fn run<S: Soc>(mut m: Machine<S>, o: &Opts) {
     let stop = run_with_reboots(&mut m, o.max_insns, !o.no_reboot && boot == "rom", boot == "app");
     let dt = t0.elapsed().as_secs_f64();
     report(&mut m, o, stop, dt);
+    if let Some(p) = &o.flash_out {
+        match std::fs::write(p, m.bus.flash_contents()) {
+            Ok(()) => eprintln!("[emu] flash written to {} ({} bytes)", p, m.bus.flash_contents().len()),
+            Err(e) => { eprintln!("[emu] --flash-out {}: {}", p, e); std::process::exit(1); }
+        }
+    }
     let pending = m.bus.ble_pending_commands();
     if pending != 0 { eprintln!("[ble] {pending} command(s) still pending at end of run"); }
     if let Some(model) = approximate { eprintln!("[emu] approximate timing totals: {:?}", model.stats()); }
