@@ -97,6 +97,10 @@ pub struct Machine<S: Soc> {
     /// that stops at a chip reset is not ended from the page.
     pub web_restart: bool,
     button_reset: bool,
+    /// `ESP32SIM_LED_LOG=1`: print every decoded LED-ring update as `[leds] t=<s> n=<updates> [[r,g,b],...]`
+    /// on stderr, at emulated time and without real-time pacing (the web stream samples, this does not).
+    /// Holds the last update count reported.
+    led_log: Option<u64>,
     ws: WebState,
     pub rt: Realtime,
     debug_rom: bool,
@@ -146,7 +150,7 @@ const BB_DEFAULT: u64 = match option_env!("ESP32SIM_BB_BUILD") {
 impl<S: Soc> Machine<S> {
     pub fn new(mac: [u8; 6], bus: S::Bus) -> Self {
         Machine {
-            web_restart: false, button_reset: false, mac, reboots: 0, stubs: HashMap::new(), stub_bloom: 0, probe_bloom: 0, stub_hits: 0, fn_probes: HashMap::new(),
+            web_restart: false, button_reset: false, led_log: std::env::var_os("ESP32SIM_LED_LOG").filter(|v| v != "0").map(|_| 0), mac, reboots: 0, stubs: HashMap::new(), stub_bloom: 0, probe_bloom: 0, stub_hits: 0, fn_probes: HashMap::new(),
             cores: (0..S::CORES).map(|i| S::new_core_with_bus(i, &bus)).collect(), core_held: (0..S::CORES).map(|i| i > 0).collect(), quantum: QUANTUM, run_steps: 0, vq_stats: [0; 4], vq_skip: 0, vq_penalty: 0, vq_max: std::env::var("ESP32SIM_VQ").ok().and_then(|v| v.parse().ok()).unwrap_or(VQ_DEFAULT),
             bb_max: std::env::var("ESP32SIM_BB").ok().and_then(|v| v.parse().ok()).unwrap_or(BB_DEFAULT).min(4096), bb_stats: [0; 8],
             bus, symbols: BTreeMap::new(),
@@ -1066,7 +1070,19 @@ impl<S: Soc> Machine<S> {
         // pacing clock live out of line.
         if self.web.is_some() && self.bus.cycles().wrapping_sub(self.ws.last_push_cycles) >= self.ws.push_interval { self.web_push_due(); }
         if self.rt.enabled && self.bus.cycles().wrapping_sub(self.rt.last_check) >= 1 << 16 { self.rt_pace(); }
+        if self.led_log.is_some() { self.led_log_poll(); }
         stopped
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn led_log_poll(&mut self) {
+        let t = self.seconds();
+        let Some((leds, updates)) = self.bus.board_ref().leds() else { return };
+        if Some(updates) == self.led_log { return; }
+        self.led_log = Some(updates);
+        let body: Vec<String> = leds.iter().map(|c| format!("[{},{},{}]", c[0], c[1], c[2])).collect();
+        eprintln!("[leds] t={:.6} n={} [{}]", t, updates, body.join(","));
     }
 
     /// EX168 s4: the due branch of the display push, out of line (EX170 semantics: re-derive the

@@ -67,6 +67,7 @@ separately lists the actual instruction count for each core.
 | `--wav F` | audio captured from I2S (whichever controller played) |
 | `--tft-png F`, `--gram-png F` | display frame (visible, scaled) / raw GRAM |
 | `--no-dump` | skip the register dump at exit |
+| `ESP32SIM_LED_LOG=1` (environment) | print every decoded update of the board's LED ring on stderr as `[leds] t=<seconds> n=<update> [[r,g,b],...]`, in physical order and at emulated time; unlike `--web` it needs no real-time pacing and samples nothing |
 
 ### PWM observation
 
